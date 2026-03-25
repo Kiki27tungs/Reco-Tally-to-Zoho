@@ -1,0 +1,5 @@
+{
+  "name": "Zoho Books Reconciliation App",
+  "description": "A transaction-level reconciliation tool using Zoho Books APIs.",
+  "requestFramePermissions": []
+}
