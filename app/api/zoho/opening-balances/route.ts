@@ -6,6 +6,8 @@ export async function GET(req: NextRequest) {
   const accessToken = authHeader?.replace('Zoho-oauthtoken ', '')?.replace('Bearer ', '');
   const apiDomain = req.headers.get('x-zoho-api-domain') || undefined;
   const organizationId = req.headers.get('x-zoho-organization-id') || undefined;
+  const { searchParams } = new URL(req.url);
+  const date = searchParams.get('date') || undefined;
 
   if (!accessToken) {
     return NextResponse.json({ error: 'No access token provided' }, { status: 401 });
@@ -15,7 +17,8 @@ export async function GET(req: NextRequest) {
     const openingBalances = await fetchOpeningBalances(
       accessToken, 
       apiDomain,
-      organizationId || undefined
+      organizationId || undefined,
+      date
     );
     return NextResponse.json(openingBalances);
   } catch (error) {

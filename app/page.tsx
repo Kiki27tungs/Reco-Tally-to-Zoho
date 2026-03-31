@@ -241,12 +241,32 @@ export default function Home() {
         headers['x-zoho-api-domain'] = tokens.api_domain;
       }
 
-      const res = await fetch('/api/zoho/opening-balances', {
+      let url = '/api/zoho/opening-balances';
+      if (fromDate) {
+        url += `?date=${fromDate}`;
+      }
+
+      const res = await fetch(url, {
         headers
       });
       if (res.ok) {
         const data = await safeJson(res);
-        setOpeningBalances(data);
+        // Transform array to object structure for UI compatibility if needed
+        // or just store as array. The UI expects { total, accounts, date }
+        if (Array.isArray(data)) {
+          const total = data.reduce((sum: number, acc: any) => {
+            const val = acc.dr_cr === 'Dr' ? acc.balance : -acc.balance;
+            return sum + val;
+          }, 0);
+          
+          setOpeningBalances({
+            accounts: data,
+            total: total,
+            date: fromDate || 'Current'
+          });
+        } else {
+          setOpeningBalances(data);
+        }
         setShowOpeningBalances(true);
       }
     } catch (err) {
@@ -254,7 +274,7 @@ export default function Home() {
     } finally {
       setFetchingData(false);
     }
-  }, [tokens, selectedOrganization]);
+  }, [tokens, selectedOrganization, fromDate]);
 
   const fetchTransactions = React.useCallback(async (accountId: string, fDate?: string, tDate?: string) => {
     if (!tokens?.access_token) return;
@@ -830,23 +850,38 @@ export default function Home() {
                       </div>
                       <div>
                         <h4 className="text-sm font-bold uppercase tracking-widest opacity-40 font-sans">Opening Balance</h4>
-                        <p className="text-xs opacity-60 italic">Organization setup balance</p>
+                        <p className="text-xs opacity-60 italic">
+                          {selectedAccount ? `For ${selectedAccount.account_name}` : 'Organization setup balance'}
+                        </p>
                       </div>
                     </div>
                     <div className="flex flex-col">
                       <div className="flex items-baseline gap-2">
                         <span className="text-4xl font-light tracking-tight">
-                          {openingBalances ? formatCurrency(openingBalances.total || 0) : '--'}
+                          {(() => {
+                            if (!openingBalances) return '--';
+                            if (selectedAccount && Array.isArray(openingBalances.accounts)) {
+                              const acc = openingBalances.accounts.find((a: any) => a.account_id === selectedAccount.account_id);
+                              return acc ? formatCurrency(acc.balance) : formatCurrency(0);
+                            }
+                            return formatCurrency(openingBalances.total || 0);
+                          })()}
                         </span>
                         {openingBalances && (
                           <span className="text-xl font-medium opacity-40">
-                            ({openingBalances.total >= 0 ? 'Dr' : 'Cr'})
+                            {(() => {
+                              if (selectedAccount && Array.isArray(openingBalances.accounts)) {
+                                const acc = openingBalances.accounts.find((a: any) => a.account_id === selectedAccount.account_id);
+                                return `(${acc?.dr_cr || 'Nil'})`;
+                              }
+                              return `(${openingBalances.total >= 0 ? 'Dr' : 'Cr'})`;
+                            })()}
                           </span>
                         )}
                       </div>
                       {openingBalances && (
                         <span className="text-[10px] mt-2 opacity-40 uppercase font-bold tracking-widest">
-                          Effective Date: {openingBalances.date}
+                          As of: {openingBalances.date}
                         </span>
                       )}
                       {!openingBalances && (
@@ -896,19 +931,33 @@ export default function Home() {
                             </thead>
                             <tbody className="divide-y divide-black/5">
                               {(openingBalances.accounts || []).map((acc: any, idx: number) => (
-                                <tr key={`${acc.account_id}-${idx}`} className="hover:bg-[#f5f5f0]/30 transition-colors">
-                                  <td className="px-6 py-4 font-medium">{acc.account_name}</td>
-                                  <td className="px-6 py-4 opacity-60 text-[10px] uppercase tracking-wider">{acc.debit_or_credit}</td>
+                                <tr 
+                                  key={`${acc.account_id}-${idx}`} 
+                                  className={`hover:bg-[#f5f5f0]/30 transition-colors cursor-pointer ${selectedAccount?.account_id === acc.account_id ? 'bg-[#5A5A40]/5' : ''}`}
+                                  onClick={() => {
+                                    const fullAcc = accounts.find(a => a.account_id === acc.account_id);
+                                    if (fullAcc) setSelectedAccount(fullAcc);
+                                  }}
+                                >
+                                  <td className="px-6 py-4 font-medium">
+                                    <div className="flex items-center gap-2">
+                                      {acc.account_name}
+                                      {selectedAccount?.account_id === acc.account_id && (
+                                        <CheckCircle2 size={12} className="text-[#5A5A40]" />
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="px-6 py-4 opacity-60 text-[10px] uppercase tracking-wider">{acc.account_type || acc.debit_or_credit}</td>
                                   <td className="px-6 py-4 text-right font-mono">
-                                    {acc.debit_or_credit === 'debit' ? formatCurrency(acc.amount) : '-'}
+                                    {acc.dr_cr === 'Dr' ? formatCurrency(acc.balance) : '-'}
                                   </td>
                                   <td className="px-6 py-4 text-right font-mono">
-                                    {acc.debit_or_credit === 'credit' ? formatCurrency(acc.amount) : '-'}
+                                    {acc.dr_cr === 'Cr' ? formatCurrency(acc.balance) : '-'}
                                   </td>
-                                  <td className={`px-6 py-4 text-right font-mono font-bold ${acc.debit_or_credit === 'debit' ? 'text-green-600' : 'text-red-600'}`}>
-                                    {formatCurrency(acc.debit_or_credit === 'credit' ? -acc.amount : acc.amount)}
+                                  <td className={`px-6 py-4 text-right font-mono font-bold ${acc.dr_cr === 'Dr' ? 'text-green-600' : 'text-red-600'}`}>
+                                    {formatCurrency(acc.balance)}
                                     <span className="ml-1 opacity-60 uppercase text-[8px]">
-                                      ({acc.debit_or_credit === 'debit' ? 'Dr' : 'Cr'})
+                                      ({acc.dr_cr})
                                     </span>
                                   </td>
                                 </tr>

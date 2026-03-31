@@ -99,30 +99,125 @@ export interface ZohoOrganization {
 export function getBaseUrl(apiDomain?: string): string {
   if (!apiDomain) return 'https://www.zohoapis.com/books/v3';
   
-  // Extract the domain part and normalize it
-  let domain = apiDomain.toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+  // Normalize the apiDomain
+  let domain = apiDomain.toLowerCase().trim();
+  if (!domain.startsWith('http')) {
+    domain = 'https://' + domain;
+  }
   
-  // Extract the region/TLD (e.g., com, in, eu, com.au, com.cn)
-  // We want to find the part after 'zohoapis.' or 'zoho.'
-  let region = 'com';
-  const zohoMatch = domain.match(/(?:zohoapis|zoho)\.(.+)$/);
-  if (zohoMatch && zohoMatch[1]) {
-    region = zohoMatch[1];
-  } else {
-    // Fallback if the above doesn't match
-    if (domain.endsWith('.com.au')) {
-      region = 'com.au';
-    } else if (domain.endsWith('.com.cn')) {
-      region = 'com.cn';
-    } else {
-      const parts = domain.split('.');
-      region = parts[parts.length - 1];
+  // Remove trailing slashes
+  domain = domain.replace(/\/+$/, '');
+  
+  // If it's already a full Books API URL, return it
+  if (domain.includes('/books/v3') || domain.includes('/api/v3')) {
+    return domain;
+  }
+
+  // Extract the host part
+  const host = domain.replace(/^https?:\/\//, '').split('/')[0];
+  
+  // Handle base zoho domains (e.g. zoho.com -> zohoapis.com)
+  const regions = ['com', 'in', 'eu', 'com.au', 'jp', 'ca', 'uk'];
+  for (const r of regions) {
+    if (host === `zoho.${r}`) {
+      return `https://www.zohoapis.${r}/books/v3`;
     }
   }
   
-  // Use the official zohoapis domain format as requested by Zoho error messages
-  // https://www.zohoapis.{region}/books/v3 is the standard for Books API
+  // If it's a zohoapis domain, use /books/v3
+  if (host.includes('zohoapis.')) {
+    return `${domain}/books/v3`;
+  }
+  
+  // If it's a books.zoho domain, use /api/v3
+  if (host.includes('books.zoho.')) {
+    return `${domain}/api/v3`;
+  }
+
+  // Default fallback: try to determine region and use zohoapis
+  let region = 'com';
+  const zohoMatch = host.match(/(?:zohoapis|zoho|books)\.(.+)$/);
+  if (zohoMatch && zohoMatch[1]) {
+    region = zohoMatch[1];
+  }
+  
   return `https://www.zohoapis.${region}/books/v3`;
+}
+
+/**
+ * Robust fetch wrapper for Zoho API with automatic retries for common URL/Domain issues
+ */
+async function zohoRequest(
+  url: string,
+  accessToken: string,
+  organizationId?: string,
+  options: { method?: string; body?: any } = {}
+) {
+  const headers: Record<string, string> = {
+    'Authorization': `Zoho-oauthtoken ${accessToken}`,
+    'Accept': 'application/json',
+  };
+  
+  if (organizationId) {
+    headers['X-com-zoho-books-organizationid'] = organizationId;
+  }
+
+  const fetchOptions: RequestInit = {
+    method: options.method || 'GET',
+    headers,
+  };
+  
+  if (options.body) {
+    fetchOptions.body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+    if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  }
+
+  const makeRequest = async (targetUrl: string) => {
+    console.log(`[Zoho API] Request: ${fetchOptions.method} ${targetUrl}`);
+    try {
+      const response = await fetch(targetUrl, fetchOptions);
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        data = { code: -1, message: 'Invalid JSON response', raw: text.substring(0, 200) };
+      }
+      return { response, data, text };
+    } catch (error) {
+      console.error(`[Zoho API] Fetch error for ${targetUrl}:`, error);
+      return { response: null, data: { code: -1, message: String(error) }, text: String(error) };
+    }
+  };
+
+  let result = await makeRequest(url);
+
+  // 1. Handle "Invalid URL Passed" or code 5 (Domain/Path mismatch)
+  if (result.data.code === 5 || result.data.message === 'Invalid URL Passed') {
+    let altUrl = url;
+    if (url.includes('www.zohoapis.')) {
+      altUrl = url.replace('www.zohoapis.', 'books.zoho.').replace('/books/v3/', '/api/v3/');
+    } else if (url.includes('books.zoho.')) {
+      altUrl = url.replace('books.zoho.', 'www.zohoapis.').replace('/api/v3/', '/books/v3/');
+    }
+
+    if (altUrl !== url) {
+      console.log(`[Zoho API] Retrying with alternative URL structure: ${altUrl}`);
+      result = await makeRequest(altUrl);
+    }
+  }
+
+  // 2. Handle "You are not authorized" (Code 2) - sometimes happens if org_id is missing in query
+  if (result.data.code === 2 || result.data.message?.toLowerCase().includes('not authorized')) {
+    if (organizationId && !url.includes('organization_id=')) {
+      const separator = url.includes('?') ? '&' : '?';
+      const altUrl = `${url}${separator}organization_id=${organizationId}`;
+      console.log(`[Zoho API] Retrying with organization_id in query: ${altUrl}`);
+      result = await makeRequest(altUrl);
+    }
+  }
+
+  return result;
 }
 
 export async function fetchOrganizations(accessToken: string, apiDomain?: string): Promise<ZohoOrganization[]> {
@@ -130,47 +225,13 @@ export async function fetchOrganizations(accessToken: string, apiDomain?: string
   const url = `${baseUrl}/organizations`;
   
   try {
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Zoho-oauthtoken ${accessToken}`,
-      },
-    });
-
-    const text = await response.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      data = { code: -1, message: 'Invalid JSON response' };
-    }
+    const { data } = await zohoRequest(url, accessToken);
 
     if (data.code !== 0) {
-      if (data.message === 'Invalid URL Passed') {
-        // Try with books.zoho. instead of www.zohoapis.
-        const altUrl = url.replace('www.zohoapis.', 'books.zoho.');
-        if (altUrl !== url) {
-          console.log(`[Zoho API] Retrying Organizations with alternative domain:`, altUrl);
-          try {
-            const altRes = await fetch(altUrl, {
-              headers: {
-                'Authorization': `Zoho-oauthtoken ${accessToken}`,
-              },
-            });
-            const altText = await altRes.text();
-            const altData = JSON.parse(altText);
-            if (altData.code === 0) {
-              return altData.organizations.map((org: any) => ({
-                organization_id: org.organization_id,
-                name: org.name,
-              }));
-            }
-          } catch (e) {}
-        }
-      }
       throw new Error(data.message || `Failed to fetch organizations (Code: ${data.code})`);
     }
 
-    return data.organizations.map((org: any) => ({
+    return (data.organizations || []).map((org: any) => ({
       organization_id: org.organization_id,
       name: org.name,
     }));
@@ -199,57 +260,18 @@ export async function fetchChartOfAccounts(accessToken: string, apiDomain?: stri
   const url = `${baseUrl}/chartofaccounts?organization_id=${orgId}`;
 
   try {
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Zoho-oauthtoken ${accessToken}`,
-        'X-com-zoho-books-organizationid': orgId!,
-      },
-    });
-
-    const text = await response.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      data = { code: -1, message: 'Invalid JSON response' };
-    }
+    const { data: initialData } = await zohoRequest(url, accessToken, orgId);
+    let data = initialData;
 
     if (data.code !== 0) {
-      if (data.message === 'Invalid URL Passed') {
-        const altUrl = url.replace('www.zohoapis.', 'books.zoho.');
-        if (altUrl !== url) {
-          console.log(`[Zoho API] Retrying ChartOfAccounts with alternative domain:`, altUrl);
-          try {
-            const altRes = await fetch(altUrl, {
-              headers: {
-                'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                'X-com-zoho-books-organizationid': orgId!,
-              },
-            });
-            const altText = await altRes.text();
-            const altData = JSON.parse(altText);
-            if (altData.code === 0) {
-              data = altData;
-            }
-          } catch (e) {}
-        }
-      }
-      if (data.code !== 0) {
-        throw new Error(data.message || `Failed to fetch chart of accounts (Code: ${data.code})`);
-      }
+      throw new Error(data.message || `Failed to fetch chart of accounts (Code: ${data.code})`);
     }
 
     let accounts = data.chartofaccounts || [];
     
     if (accounts.length === 0) {
       const accUrl = `${baseUrl}/accounts?organization_id=${orgId}`;
-      const accResponse = await fetch(accUrl, {
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${accessToken}`,
-          'X-com-zoho-books-organizationid': orgId,
-        },
-      });
-      const accData = await safeJson(accResponse);
+      const { data: accData } = await zohoRequest(accUrl, accessToken, orgId);
       if (accData.code === 0) {
         accounts = accData.accounts || [];
       }
@@ -296,47 +318,16 @@ export async function fetchAccountDetails(
 
   for (const url of endpoints) {
     try {
-      const response = await fetch(url, {
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${accessToken}`,
-          'X-com-zoho-books-organizationid': orgId!,
-        },
-      });
-
-      const text = await response.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        data = { code: -1, message: 'Invalid JSON response' };
-      }
+      const { data } = await zohoRequest(url, accessToken, orgId);
 
       if (data.code === 0) {
         return data.account || data.bankaccount;
       }
 
-      if (data.code !== 0 && data.message === 'Invalid URL Passed') {
-        // Try with books.zoho. instead of www.zohoapis.
-        const altUrl = url.replace('www.zohoapis.', 'books.zoho.');
-        if (altUrl !== url) {
-          console.log(`[Zoho API] Retrying Account Details with alternative domain:`, altUrl);
-          try {
-            const altRes = await fetch(altUrl, {
-              headers: {
-                'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                'X-com-zoho-books-organizationid': orgId!,
-              },
-            });
-            const altText = await altRes.text();
-            const altData = JSON.parse(altText);
-            if (altData.code === 0) {
-              return altData.account || altData.bankaccount;
-            }
-          } catch (e) {}
-        }
-      }
+      console.log(`[Zoho API] Account Details failed for ${url}: ${data.message} (Code: ${data.code})`);
       lastError = data;
     } catch (error) {
+      console.error(`[Zoho API] Error fetching from ${url}:`, error);
       lastError = error;
     }
   }
@@ -385,94 +376,19 @@ export async function fetchAccountTransactions(
     try {
       // Try the more direct bankaccounts/{id}/transactions endpoint first
       const url = `${baseUrl}/bankaccounts/${accountId}/transactions?${params.toString()}`;
-      console.log('[Zoho API] Calling Banking API (direct):', url);
-      const res = await fetch(url, {
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${accessToken}`,
-          'X-com-zoho-books-organizationid': orgId!,
-          'Accept': 'application/json'
-        },
-      });
-      const text = await res.text();
-      let json;
-      try {
-        json = JSON.parse(text);
-      } catch (e) {
-        json = { code: -1, message: 'Invalid JSON' };
-      }
+      const result = await zohoRequest(url, accessToken, orgId);
+      
+      if (result.data.code === 0) return result;
 
       // If direct endpoint fails, try the general banktransactions endpoint
-      if (json.code !== 0) {
-        if (json.message === 'Invalid URL Passed') {
-          // Try with books.zoho. instead of www.zohoapis.
-          const altUrl = url.replace('www.zohoapis.', 'books.zoho.');
-          if (altUrl !== url) {
-            console.log(`[Zoho API] Retrying Banking API (direct) with alternative domain:`, altUrl);
-            try {
-              const altRes = await fetch(altUrl, {
-                headers: {
-                  'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                  'X-com-zoho-books-organizationid': orgId!,
-                  'Accept': 'application/json'
-                },
-              });
-              const altText = await altRes.text();
-              const altJson = JSON.parse(altText);
-              if (altJson.code === 0) {
-                return { res: altRes, text: altText, json: altJson };
-              }
-            } catch (e) {}
-          }
-        }
-
-        console.log(`[Zoho API] Banking API (direct) failed: ${json.message}. Trying general endpoint...`);
-        const generalParams = new URLSearchParams(params);
-        generalParams.append('account_id', accountId);
-        const generalUrl = `${baseUrl}/banktransactions?${generalParams.toString()}`;
-        const generalRes = await fetch(generalUrl, {
-          headers: {
-            'Authorization': `Zoho-oauthtoken ${accessToken}`,
-            'X-com-zoho-books-organizationid': orgId!,
-            'Accept': 'application/json'
-          },
-        });
-        const generalText = await generalRes.text();
-        let generalJson;
-        try {
-          generalJson = JSON.parse(generalText);
-        } catch (e) {
-          generalJson = { code: -1, message: 'Invalid JSON' };
-        }
-
-        if (generalJson.code !== 0 && generalJson.message === 'Invalid URL Passed') {
-          // Try with books.zoho. instead of www.zohoapis.
-          const altGeneralUrl = generalUrl.replace('www.zohoapis.', 'books.zoho.');
-          if (altGeneralUrl !== generalUrl) {
-            console.log(`[Zoho API] Retrying Banking API (general) with alternative domain:`, altGeneralUrl);
-            try {
-              const altGeneralRes = await fetch(altGeneralUrl, {
-                headers: {
-                  'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                  'X-com-zoho-books-organizationid': orgId!,
-                  'Accept': 'application/json'
-                },
-              });
-              const altGeneralText = await altGeneralRes.text();
-              const altGeneralJson = JSON.parse(altGeneralText);
-              if (altGeneralJson.code === 0) {
-                return { res: altGeneralRes, text: altGeneralText, json: altGeneralJson };
-              }
-            } catch (e) {}
-          }
-        }
-
-        return { res: generalRes, text: generalText, json: generalJson };
-      }
-
-      return { res, text, json };
+      console.log(`[Zoho API] Banking API (direct) failed: ${result.data.message}. Trying general endpoint...`);
+      const generalParams = new URLSearchParams(params);
+      generalParams.append('account_id', accountId);
+      const generalUrl = `${baseUrl}/banktransactions?${generalParams.toString()}`;
+      return await zohoRequest(generalUrl, accessToken, orgId);
     } catch (err) {
       console.error('[Zoho API] Error in tryBanking:', err);
-      return { res: null, text: String(err), json: { code: -1, message: String(err) } };
+      return { response: null, text: String(err), data: { code: -1, message: String(err) } };
     }
   };
 
@@ -484,9 +400,6 @@ export async function fetchAccountTransactions(
     if (fromDate && fromDate.trim() !== '') params.append('from_date', fromDate);
     if (toDate && toDate.trim() !== '') params.append('to_date', toDate);
 
-    // Some Zoho environments use accounttransactions (no underscore)
-    // Others use account_transactions (with underscore)
-    // The correct endpoint for Account Transactions report is often just 'reports/accounttransactions'
     const endpoints = [
       'reports/accounttransactions', 
       'reports/account_transactions', 
@@ -496,7 +409,7 @@ export async function fetchAccountTransactions(
       `organizations/${orgId}/reports/accounttransactions`,
       `organizations/${orgId}/reports/account_transactions`
     ];
-    let lastResult: any = { code: -1, message: 'No endpoint tried' };
+    let lastResult: any = { data: { code: -1, message: 'No endpoint tried' } };
 
     for (const endpoint of endpoints) {
       // Try both account_id and account_ids (some versions use plural)
@@ -510,79 +423,24 @@ export async function fetchAccountTransactions(
         const cleanBaseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
         const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
         const url = `${cleanBaseUrl}/${cleanEndpoint}?${queryStr}`;
-        console.log(`[Zoho API] Calling Report API (${endpoint}):`, url);
         
-        try {
-          const res = await fetch(url, {
-            headers: {
-              'Authorization': `Zoho-oauthtoken ${accessToken}`,
-              'X-com-zoho-books-organizationid': orgId!,
-              'Accept': 'application/json'
-            },
-          });
-          
-          const text = await res.text();
-          let json;
-          try {
-            json = JSON.parse(text);
-          } catch (e) {
-            json = { code: -1, message: 'Invalid JSON response', raw: text };
-          }
+        const result = await zohoRequest(url, accessToken, orgId);
+        if (result.data.code === 0) {
+          console.log(`[Zoho API] Report API succeeded!`);
+          return result;
+        }
+        
+        lastResult = result;
 
-          if (json.code === 0) {
-            console.log(`[Zoho API] Report API (${endpoint}) succeeded!`);
-            return { res, text, json };
-          }
+        // Try without organization_id in query string if it failed with auth error
+        if (result.data.code === 2 || result.data.message?.toLowerCase().includes('not authorized')) {
+          const noOrgParams = new URLSearchParams(queryStr);
+          noOrgParams.delete('organization_id');
+          const noOrgUrl = `${cleanBaseUrl}/${cleanEndpoint}?${noOrgParams.toString()}`;
+          console.log(`[Zoho API] Retrying Report API without org_id in query:`, noOrgUrl);
           
-          lastResult = { res, text, json };
-          console.log(`[Zoho API] Report API (${endpoint}) failed with code ${json.code}: ${json.message}`);
-          if (json.code !== 0 && json.message === 'Invalid URL Passed') {
-            // Try with books.zoho. instead of www.zohoapis.
-            const altUrl = url.replace('www.zohoapis.', 'books.zoho.');
-            if (altUrl !== url) {
-              console.log(`[Zoho API] Retrying Report API with alternative domain:`, altUrl);
-              try {
-                const altRes = await fetch(altUrl, {
-                  headers: {
-                    'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                    'X-com-zoho-books-organizationid': orgId!,
-                    'Accept': 'application/json'
-                  },
-                });
-                const altText = await altRes.text();
-                const altJson = JSON.parse(altText);
-                if (altJson.code === 0) {
-                  return { res: altRes, text: altText, json: altJson };
-                }
-                console.log(`[Zoho API] Alternative domain also failed: ${altJson.message}`);
-              } catch (e) {}
-            }
-
-            // Try without organization_id in query string if header is present
-            const noOrgParams = new URLSearchParams(queryStr);
-            noOrgParams.delete('organization_id');
-            const noOrgUrl = `${cleanBaseUrl}/${cleanEndpoint}?${noOrgParams.toString()}`;
-            console.log(`[Zoho API] Retrying Report API without org_id in query:`, noOrgUrl);
-            
-            const noOrgRes = await fetch(noOrgUrl, {
-              headers: {
-                'Authorization': `Zoho-oauthtoken ${accessToken}`,
-                'X-com-zoho-books-organizationid': orgId!,
-                'Accept': 'application/json'
-              },
-            });
-            const noOrgText = await noOrgRes.text();
-            try {
-              const noOrgJson = JSON.parse(noOrgText);
-              if (noOrgJson.code === 0) {
-                return { res: noOrgRes, text: noOrgText, json: noOrgJson };
-              }
-              console.log(`[Zoho API] Report API without org_id also failed: ${noOrgJson.message}`);
-            } catch (e) {}
-          }
-        } catch (err) {
-          console.error(`[Zoho API] Error calling ${endpoint}:`, err);
-          lastResult = { res: null, text: String(err), json: { code: -1, message: String(err) } };
+          const noOrgResult = await zohoRequest(noOrgUrl, accessToken, orgId);
+          if (noOrgResult.data.code === 0) return noOrgResult;
         }
       }
     }
@@ -594,29 +452,29 @@ export async function fetchAccountTransactions(
     // Try the most likely API first
     if (isBankOrCard) {
       const result = await tryBanking();
-      data = result.json;
+      data = result.data;
       responseText = result.text;
-      response = result.res;
+      response = result.response;
       
       if (data.code !== 0) {
         console.log(`[Zoho API] Banking API failed (${data.message}), trying Report API...`);
         const reportResult = await tryReport();
-        data = reportResult.json;
+        data = reportResult.data;
         responseText = reportResult.text;
-        response = reportResult.res;
+        response = reportResult.response;
       }
     } else {
       const result = await tryReport();
-      data = result.json;
+      data = result.data;
       responseText = result.text;
-      response = result.res;
+      response = result.response;
       
       if (data.code !== 0) {
         console.log(`[Zoho API] Report API failed (${data.message}), trying Banking API...`);
         const bankingResult = await tryBanking();
-        data = bankingResult.json;
+        data = bankingResult.data;
         responseText = bankingResult.text;
-        response = bankingResult.res;
+        response = bankingResult.response;
       }
     }
 
@@ -936,46 +794,89 @@ export async function fetchAccountBalances(
 }
 
 /**
- * Fetches the Opening Balances from Zoho Books settings.
- * As per the provided documentation reference.
+ * Fetches balances for all accounts as of a specific date.
+ * If no date is provided, it fetches current balances using the provided reference logic.
+ * If a date is provided, it uses the Trial Balance report to get balances as of that date.
  */
 export async function fetchOpeningBalances(
   accessToken: string,
   apiDomain?: string,
-  organizationId?: string
-): Promise<any> {
+  organizationId?: string,
+  date?: string
+): Promise<ClosingBalance[]> {
   const baseUrl = getBaseUrl(apiDomain);
   let orgId = organizationId;
 
   if (!orgId) {
     try {
       const orgs = await fetchOrganizations(accessToken, apiDomain);
-      if (orgs.length === 0) return null;
+      if (orgs.length === 0) return [];
       orgId = orgs[0].organization_id;
     } catch (e) {
-      return null;
+      return [];
     }
   }
 
-  const url = `${baseUrl}/settings/openingbalances?organization_id=${orgId}`;
+  // If a date is provided, use the Trial Balance report for accurate "as of" balances
+  if (date && date.trim() !== '') {
+    try {
+      console.log(`[Zoho API] Fetching Opening Balances as of ${date} using Trial Balance report`);
+      const params = new URLSearchParams({
+        organization_id: orgId!,
+        date: date,
+      });
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Zoho-oauthtoken ${accessToken}`,
-        'X-com-zoho-books-organizationid': orgId!,
-      },
-    });
+      // Try multiple domain variations for reports
+      const tryTrialBalance = async (domain: string) => {
+        const url = `${domain}/reports/trialbalance?${params.toString()}`;
+        const res = await fetch(url, {
+          headers: {
+            'Authorization': `Zoho-oauthtoken ${accessToken}`,
+            'X-com-zoho-books-organizationid': orgId!,
+            'Accept': 'application/json'
+          },
+        });
+        const text = await res.text();
+        try {
+          return { res, text, json: JSON.parse(text) };
+        } catch (e) {
+          return { res, text, json: { code: -1, message: 'Invalid JSON' } };
+        }
+      };
 
-    const data = await safeJson(response);
-    if (data.code !== 0) {
-      throw new Error(data.message || `Failed to fetch opening balances (Code: ${data.code})`);
+      let result = await tryTrialBalance(baseUrl);
+      if (result.json.code !== 0 && result.json.message === 'Invalid URL Passed') {
+        const altBaseUrl = baseUrl.replace('www.zohoapis.', 'books.zoho.');
+        if (altBaseUrl !== baseUrl) {
+          result = await tryTrialBalance(altBaseUrl);
+        }
+      }
+
+      if (result.json.code === 0 && result.json.trialbalance) {
+        return result.json.trialbalance.map((acc: any) => {
+          const debit = acc.debit_balance || 0;
+          const credit = acc.credit_balance || 0;
+          const balance = debit - credit;
+          
+          // Determine Dr/Cr based on account type if available, or just the sign
+          // Trial balance doesn't always return account_type, so we use the sign
+          return {
+            account_id: acc.account_id,
+            account_code: acc.account_code || "",
+            account_name: acc.account_name,
+            account_type: acc.account_type || "",
+            balance: Math.abs(balance),
+            dr_cr: balance === 0 ? "Nil" : (balance > 0 ? "Dr" : "Cr")
+          };
+        });
+      }
+      console.warn(`[Zoho API] Trial Balance report failed (Code: ${result.json.code}), falling back to current balances`);
+    } catch (error) {
+      console.error('[Zoho API] Error fetching Trial Balance:', error);
     }
-
-    return data.opening_balance;
-  } catch (error) {
-    console.error('[Zoho API] Error (OpeningBalances):', error);
-    return null;
   }
+
+  // Fallback to current balances logic (the reference code provided by the user)
+  return fetchAccountBalances(accessToken, apiDomain, orgId);
 }
 
